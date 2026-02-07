@@ -17,3 +17,14 @@ ZI Auto Clicker is an advanced Windows auto-clicker and key/mouse automation too
 - Easy-to-use GUI with modern theme
 
 ---
+## Safety & Security
+
+**ZI Auto Clicker is completely safe and not a virus.**
+
+- The application **only automates keyboard and mouse inputs**.  
+- It does **not access your files, network, or system settings**.  
+- It does **not collect any personal data**.  
+- All actions are performed **locally on your machine**, within the allowed application or globally if specified.  
+- The project is **open source under GPL-3.0**, which means anyone can inspect the code to verify it is safe.  
+
+> ⚠️ Always download software from trusted sources. Since this project is open-source, you can review the code yourself to confirm that it contains **no malware, spyware, or hidden functionality**.
