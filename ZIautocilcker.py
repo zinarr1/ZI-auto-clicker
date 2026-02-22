@@ -1,578 +1,620 @@
 # Original author: zinarr1
 
 import sys
-import os
-import subprocess
-import threading
 import time
-import psutil
-import win32process
-import pygetwindow as gw
-import win32api
-import win32con
-
+import threading
+import ctypes
+from ctypes import wintypes
+from PyQt5.QtCore import QEvent
 from PyQt5 import QtWidgets, QtCore
-from PyQt5.QtCore import Qt, QEvent
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QLabel, QLineEdit, QPushButton, QComboBox,
-    QCheckBox, QGridLayout
+    QApplication, QWidget, QLabel, QLineEdit,
+    QPushButton, QComboBox, QGridLayout
 )
-from pynput import keyboard, mouse
-from pynput.keyboard import Key, Controller as KeyboardController
-from pynput.mouse import Button, Controller as MouseController
+from PyQt5.QtGui import QDoubleValidator
+from PyQt5.QtGui import QIntValidator
+from PyQt5.QtCore import pyqtSlot, Qt, Q_ARG, QMetaObject
+from os import _exit
+import win32gui
+import win32process
+import psutil
+# ============================================
+# WINDOWS / CTYPES SETUP
+# ============================================
+
+user32 = ctypes.windll.user32
+
+WH_KEYBOARD_LL = 13
+WH_MOUSE_LL = 14
+
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONUP = 0x0202
+WM_RBUTTONDOWN = 0x0204
+WM_RBUTTONUP = 0x0205
+WM_MBUTTONDOWN = 0x0207
+WM_MBUTTONUP = 0x0208
+
+WM_XBUTTONDOWN = 0x020B
+WM_XBUTTONUP   = 0x020C
+
+XBUTTON1 = 1
+XBUTTON2 = 2
+
+MOUSEEVENTF_LEFTDOWN   = 0x0002
+MOUSEEVENTF_LEFTUP     = 0x0004
+MOUSEEVENTF_RIGHTDOWN  = 0x0008
+MOUSEEVENTF_RIGHTUP    = 0x0010
+MOUSEEVENTF_MIDDLEDOWN = 0x0020
+MOUSEEVENTF_MIDDLEUP   = 0x0040
+MOUSEEVENTF_XDOWN      = 0x0080
+MOUSEEVENTF_XUP        = 0x0100
+
+LLKHF_INJECTED = 0x10
+LLMHF_INJECTED = 0x01
+
+LRESULT = ctypes.c_int64 if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_int32
+
+user32.CallNextHookEx.argtypes = (
+    wintypes.HHOOK,
+    ctypes.c_int,
+    wintypes.WPARAM,
+    ctypes.c_void_p
+)
+user32.CallNextHookEx.restype = LRESULT
+
+# ============================================
+# STRUCTS
+# ============================================
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", wintypes.DWORD),
+        ("scanCode", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_void_p),
+    ]
+
+class MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("pt", wintypes.POINT),
+        ("mouseData", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_void_p),
+    ]
+
+# ============================================
+# GLOBAL STATE
+# ============================================
+
+real_state = {}
+listen_mode = None  # "trigger" | "affected"
+
+# ============================================
+# AUTOCLICKER
+# ============================================
 
 class AutoClicker(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ZI Auto Clicker")
-        self.setFixedSize(500, 600)
 
-        # Pynput controllers
-        self.keyboard_controller = KeyboardController()
-        self.mouse_controller = MouseController()
+        self.setWindowTitle("Low-Level Hook ZIAutoClicker")
+        self.setFixedSize(420, 350)
 
-        # State variables
-        self.listening_for = None
         self.trigger_key = None
         self.affected_key = None
         self.running = False
-        self.click_threads = []
-        self.clicker_count = 1
-        self.trigger_lock = False
+        self.cps = 15
 
-        self.start_mode = "Hold"
-        self.effect_mode = "Oto-click"
-        self.clicks_per_second = 20
-        self.gizli_katsayi = 1.00
-
+        self.work_one_window = False
         self.selected_pid = None
-        self.window_dict = {}
 
+        self.timer_running = False
         self.use_timer = False
-        self.hold_time = 2.0
-        self.release_time = 1.0
+        self.hold_duration = 1.0
+        self.release_duration = 1.0
+        self.toggle_timer_running = False
+        
+        # UI
+        self.build_ui()
+     
+        # Worker thread  
+        self.worker_thread = threading.Thread(target=self.worker, daemon=True)    
+        self.worker_thread.start()
 
-        # Build UI
-        self.init_ui()
+        threading.Thread(target=self.hook_thread, daemon=True).start()
 
-        # Start global listeners
-        self.keyboard_listener = keyboard.Listener(
-            on_press=self.on_key_event_press,
-            on_release=self.on_key_event_release
-        )
-        self.keyboard_listener.daemon = True
-        self.keyboard_listener.start()
+    # ---------------- UI ----------------
+    def build_ui(self):
+        layout = QGridLayout(self)
 
-        self.mouse_listener = mouse.Listener(
-            on_click=self.on_mouse_click
-        )
-        self.mouse_listener.daemon = True
-        self.mouse_listener.start()
-
-        # Populate window list initially
-        self.refresh_window_list()
-
-        self.setStyleSheet("""
-            /* === Genel Ayarlar === */
-            QWidget {
-                background-color: #202225;
-                color: #f5f5f5;
-                font-family: "Segoe UI", "Inter", sans-serif;
-                font-size: 13px;
-            }
-
-            QLabel {
-                color: #f5f5f5;
-            }
-
-            /* === Giriş Alanları === */
-            QLineEdit, QTextEdit, QPlainTextEdit, QComboBox {
-                background-color: #2f3136;
-                border: 1px solid #3e4147;
-                border-radius: 6px;
-                padding: 6px 8px;
-                color: #ffffff;
-                selection-background-color: #5865f2; /* Discord mavisi */
-                selection-color: #ffffff;
-            }
-
-            QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus {
-                border: 1px solid #7289da;
-                background-color: #35383d;
-            }
-
-            /* === Butonlar === */
-            QPushButton {
-                background-color: #5865f2;
-                color: #ffffff;
-                border: none;
-                border-radius: 6px;
-                padding: 6px 14px;
-                font-weight: 500;
-                transition: 0.2s;
-            }
-
-            QPushButton:hover {
-                background-color: #4752c4;
-            }
-
-            QPushButton:pressed {
-                background-color: #3a3f9f;
-            }
-
-            /* === Checkbox === */
-            QCheckBox {
-                color: #f5f5f5;
-                spacing: 6px;
-            }
-
-            QCheckBox::indicator {
-                width: 16px;
-                height: 16px;
-                border: 2px solid #72767d;
-                border-radius: 4px;
-                background: #2f3136;
-            }
-
-            QCheckBox::indicator:checked {
-                background-color: #5865f2;
-                border-color: #5865f2;
-            }
-
-            /* === ComboBox Listesi === */
-            QComboBox QAbstractItemView {
-                background-color: #2f3136;
-                color: #ffffff;
-                border: 1px solid #3e4147;
-                selection-background-color: #5865f2;
-                selection-color: #ffffff;
-                border-radius: 6px;
-            }
-
-            /* === Scrollbar === */
-            QScrollBar:vertical, QScrollBar:horizontal {
-                background: #2f3136;
-                width: 10px;
-                height: 10px;
-                border-radius: 5px;
-            }
-
-            QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
-                background: #5865f2;
-                border-radius: 5px;
-            }
-
-            /* === Tooltip === */
-            QToolTip {
-                background-color: #2f3136;
-                color: #ffffff;
-                border: 1px solid #3e4147;
-                padding: 4px 8px;
-                border-radius: 6px;
-            }
-
-            /* === Sekmeler === */
-            QTabWidget::pane {
-                border: 1px solid #3e4147;
-                background-color: #202225;
-                border-radius: 8px;
-            }
-
-            QTabBar::tab {
-                background: #2f3136;
-                color: #b9bbbe;
-                padding: 6px 12px;
-                border-top-left-radius: 6px;
-                border-top-right-radius: 6px;
-                margin-right: 2px;
-            }
-
-            QTabBar::tab:selected {
-                background: #5865f2;
-                color: #ffffff;
-            }
-        """)
-
-
-    def init_ui(self):
-        layout = QGridLayout()
-
-    def init_ui(self):
-        layout = QGridLayout()
-
-        layout.addWidget(QLabel("Trigger Key:"), 0, 0)
+        layout.addWidget(QLabel("Trigger Key"), 0, 0)
         self.trigger_entry = QLineEdit()
         self.trigger_entry.setReadOnly(True)
         layout.addWidget(self.trigger_entry, 0, 1)
-        self.trigger_btn = QPushButton("Select")
-        self.trigger_btn.clicked.connect(lambda: self.listen_for_key("trigger"))
-        layout.addWidget(self.trigger_btn, 0, 2)
+        btn = QPushButton("Select")
+        btn.clicked.connect(lambda: self.set_listen("trigger"))
+        layout.addWidget(btn, 0, 2)
 
-        layout.addWidget(QLabel("Affected Key:"), 1, 0)
+        layout.addWidget(QLabel("Affected Key"), 1, 0)
         self.affected_entry = QLineEdit()
         self.affected_entry.setReadOnly(True)
         layout.addWidget(self.affected_entry, 1, 1)
-        self.affected_btn = QPushButton("Select")
-        self.affected_btn.clicked.connect(lambda: self.listen_for_key("affected"))
-        layout.addWidget(self.affected_btn, 1, 2)
+        btn = QPushButton("Select")
+        btn.clicked.connect(lambda: self.set_listen("affected"))
+        layout.addWidget(btn, 1, 2)
 
-        layout.addWidget(QLabel("Start Type:"), 2, 0)
-        self.start_mode_combo = QComboBox()
-        self.start_mode_combo.addItems(["Hold", "Toggle"])
-        self.start_mode_combo.setCurrentText(self.start_mode)
-        self.start_mode_combo.currentTextChanged.connect(self.update_settings)
-        layout.addWidget(self.start_mode_combo, 2, 1, 1, 2)
 
-        layout.addWidget(QLabel("Affected Key Mode:"), 3, 0)
-        self.effect_mode_combo = QComboBox()
-        self.effect_mode_combo.addItems(["Auto-click", "Hold Down"])
-        self.effect_mode_combo.setCurrentText(self.effect_mode)
-        self.effect_mode_combo.currentTextChanged.connect(self.update_settings)
-        layout.addWidget(self.effect_mode_combo, 3, 1, 1, 2)
+        layout.addWidget(QLabel("CPS"), 2, 0)
 
-        layout.addWidget(QLabel("Clicks Per Second (CPS):"), 4, 0)
-        self.cps_entry = QLineEdit(str(self.clicks_per_second))
-        self.cps_entry.textChanged.connect(self.update_settings)
-        layout.addWidget(self.cps_entry, 4, 1, 1, 2)
+        self.cps_entry = QLineEdit()
+        self.cps_entry.setPlaceholderText("CPS number")
+        self.cps_entry.setFixedWidth(60)
+        self.cps_entry.setText(str(self.cps))
+        self.cps_entry.setValidator(QIntValidator())
+        layout.addWidget(self.cps_entry, 2, 1, 1, 2)
 
-        layout.addWidget(QLabel("Number of Clickers:"), 5, 0)
-        self.clicker_entry = QLineEdit(str(self.clicker_count))
-        self.clicker_entry.textChanged.connect(self.update_settings)
-        layout.addWidget(self.clicker_entry, 5, 1, 1, 2)
+        self.cps_entry.textChanged.connect(self.update_cps_from_entry)
 
-        layout.addWidget(QLabel("Select Application (EXE):"), 6, 0)
+        layout.addWidget(QLabel("Affected Mode"), 4, 0)
+        self.affected_mode_box = QComboBox()
+        self.affected_mode_box.addItems(["Auto-Click", "Hold"])
+        self.affected_mode_box.setCurrentText("Auto-Click")
+        layout.addWidget(self.affected_mode_box, 4, 1, 1, 2)
+
+        layout.addWidget(QLabel("Trigger Mode"), 3, 0)
+        self.trigger_mode_box = QComboBox()
+        self.trigger_mode_box.addItems(["Hold", "Toggle"])
+        self.trigger_mode_box.setCurrentText("Hold")
+        layout.addWidget(self.trigger_mode_box, 3, 1, 1, 2)
+
+        self.disable_checkbox = QtWidgets.QCheckBox("Disable.")
+        self.disable_checkbox.setChecked(False)
+        layout.addWidget(self.disable_checkbox, 5, 0, 1, 3)
+
+        self.timer_checkbox = QtWidgets.QCheckBox("Enable Timer")
+        layout.addWidget(self.timer_checkbox, 6, 0, 1, 3)
+        self.timer_checkbox.stateChanged.connect(self.toggle_timer_fields)
+
+        self.hold_label = QLabel("Hold duration (sec)")
+        layout.addWidget(self.hold_label, 7, 0)
+        self.hold_entry = QLineEdit("1.0")
+
+        self.hold_entry.setValidator(QDoubleValidator())  
+        layout.addWidget(self.hold_entry, 7, 1, 1, 2)
+
+        self.release_label = QLabel("Release duration (sec)")
+        layout.addWidget(self.release_label, 8, 0)
+        self.release_entry = QLineEdit("1.0")
+        self.release_entry.setValidator(QDoubleValidator())  
+        layout.addWidget(self.release_entry, 8, 1, 1, 2)
+
+        # ---------------- WORK ONE WINDOW ----------------
+
+        self.work_checkbox = QtWidgets.QCheckBox("Work one window")
+        layout.addWidget(self.work_checkbox, 10, 0, 1, 3)
+
         self.window_combo = QComboBox()
-        self.window_combo.currentTextChanged.connect(self.select_window)
-        layout.addWidget(self.window_combo, 6, 1)
-        self.window_refresh_btn = QPushButton("refresh")
-        self.window_refresh_btn.setFixedWidth(80)
-        self.window_refresh_btn.clicked.connect(self.refresh_window_list)
-        layout.addWidget(self.window_refresh_btn, 6, 2)
+        layout.addWidget(self.window_combo, 11, 0, 1, 3)
 
-        self.only_target_chk = QCheckBox("Work only in selected window")
-        layout.addWidget(self.only_target_chk, 7, 0, 1, 3)
-        
-        self.timer_warning = QLabel("\n\n\nWARNING!! Set clicker count max 10 or system will sound alert")
-        layout.addWidget(self.timer_warning, 13, 0, 1, 3, alignment=QtCore.Qt.AlignCenter)
+        self.refresh_windows()
+        self.window_combo.currentIndexChanged.connect(self.update_selected_pid)
+        self.work_checkbox.stateChanged.connect(self.toggle_window_mode)
 
-        self.disable_chk = QCheckBox("Disable Clicker")
-        layout.addWidget(self.disable_chk, 8, 0, 1, 3)
+        self.reverse_checkbox = QtWidgets.QCheckBox("Reverse time duration order")
+        layout.addWidget(self.reverse_checkbox, 9, 0, 1, 3)
 
-        self.timer_chk = QCheckBox("Activate Timer")
-        self.timer_chk.stateChanged.connect(self.toggle_timer_options)
-        layout.addWidget(self.timer_chk, 9, 0, 1, 3)
-
-        self.hold_label = QLabel("Hold Duration (sec):")
-        layout.addWidget(self.hold_label, 10, 0)
-        self.hold_entry = QLineEdit(str(self.hold_time))
-        self.hold_entry.textChanged.connect(self.update_settings)
-        layout.addWidget(self.hold_entry, 10, 1, 1, 2)
-
-        self.release_label = QLabel("Release Duration (sec):")
-        layout.addWidget(self.release_label, 11, 0)
-        self.release_entry = QLineEdit(str(self.release_time))
-        self.release_entry.textChanged.connect(self.update_settings)
-        layout.addWidget(self.release_entry, 11, 1, 1, 2)
-
-        self.reverse_chk = QCheckBox("Reverse timer duration order")
-        layout.addWidget(self.reverse_chk, 12, 0, 1, 3)
-
-        self.status_label = QLabel("Ready")
-        layout.addWidget(self.status_label, 13, 0, 1, 3, alignment=QtCore.Qt.AlignCenter)
-
-        self.restart_btn = QPushButton("Restart")
-        self.restart_btn.clicked.connect(self.restart_program)
-        layout.addWidget(self.restart_btn, 14, 0, 1, 3)
-
-        # Hide timer-related widgets initially
         self.hold_label.hide()
         self.hold_entry.hide()
         self.release_label.hide()
         self.release_entry.hide()
-        self.reverse_chk.hide()
+        self.reverse_checkbox.hide()
 
-        self.setLayout(layout)
+        self.status = QLabel("Ready")
+        self.status.setAlignment(Qt.AlignCenter) 
+        layout.addWidget(self.status, 99, 0, 1, 3)
 
-    def listen_for_key(self, which):
-        self.listening_for = which
-        self.status_label.setText(f"{which.capitalize()}: Select a button...")
+        self.installEventFilter(self)
+        for w in self.findChildren(QWidget):
+            w.installEventFilter(self)
 
-    def on_key_event_press(self, key):
-        self.handle_key_event(key, True)
-
-    def on_key_event_release(self, key):
-        self.handle_key_event(key, False)
-
-    def on_mouse_click(self, x, y, button, pressed):
-        key_name = f"mouse.{button.name}"
-        self.handle_key_event(key_name, pressed, is_mouse=True)
-
-    def handle_key_event(self, key, is_press, is_mouse=False):
-        if is_mouse:
-            key_name = key
-        else:
-            if isinstance(key, mouse.Button):
-                key_name = f"mouse.{key.name}"
-            elif hasattr(key, 'char') and key.char:
-                key_name = key.char
-            elif hasattr(key, 'name') and key.name:
-                key_name = key.name
-            else:
-                key_name = str(key)
-
-        # If waiting for user to press a key to set trigger or affected
-        if self.listening_for:
-            if self.listening_for == 'trigger':
-                self.set_trigger_key(key_name)
-            elif self.listening_for == 'affected':
-                self.set_affected_key(key_name)
-            self.listening_for = None
-            self.status_label.setText("Button selected.")
-            return
-
-        if self.disable_chk.isChecked():
-            return
-
-        if self.only_target_chk.isChecked():
-            try:
-                hwnd = gw.getActiveWindow()._hWnd
+    def enum_handler(self, hwnd, _):
+        if win32gui.IsWindowVisible(hwnd):
+            title = win32gui.GetWindowText(hwnd)
+            if title:
                 _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                if pid != self.selected_pid:
-                    return
-            except:
-                return
+                try:
+                    process = psutil.Process(pid)
+                    name = process.name()
+                    display = f"{name} - {title}"
+                    self.window_combo.addItem(display, pid)
+                except:
+                    pass
 
-        if key_name == self.trigger_key:
-            if self.start_mode == "Hold":
-                if is_press and not self.running:
-                    self.start_clicking()
-                elif not is_press and self.running:
-                    self.stop_clicking()
-            elif self.start_mode == "Toggle":
-                if is_press and not self.trigger_lock:
-                    self.trigger_lock = True
-                    if not self.running:
-                        self.start_clicking()
-                    else:
-                        self.stop_clicking()
-                elif not is_press:
-                    self.trigger_lock = False
-
-    def set_trigger_key(self, key_name):
-        self.trigger_key = key_name
-        self.trigger_entry.setText(key_name)
-
-    def set_affected_key(self, key_name):
-        self.affected_key = key_name
-        self.affected_entry.setText(key_name)
-
-    def update_settings(self):
-        self.start_mode = self.start_mode_combo.currentText()
-        self.effect_mode = self.effect_mode_combo.currentText()
-        try:
-            cps = int(self.cps_entry.text())
-            self.clicks_per_second = max(1, cps)
-        except:
-            pass
-        try:
-            count = int(self.clicker_entry.text())
-            self.clicker_count = max(1, count)
-        except:
-            self.clicker_count = 1
-        try:
-            self.hold_time = float(self.hold_entry.text())
-            self.release_time = float(self.release_entry.text())
-        except:
-            pass
-
-    def toggle_timer_options(self, state):
-        active = self.timer_chk.isChecked()
-        if active:
-            self.hold_label.show()
-            self.hold_entry.show()
-            self.release_label.show()
-            self.release_entry.show()
-            self.reverse_chk.show()
-        else:
-            self.hold_label.hide()
-            self.hold_entry.hide()
-            self.release_label.hide()
-            self.release_entry.hide()
-            self.reverse_chk.hide()
-
-    def perform_action(self):
-        # Each thread uses individual CPS × gizli_katsayi
-        hedef_cps = self.clicks_per_second * self.gizli_katsayi
-        interval = 1.0 / hedef_cps
-        next_click_time = time.perf_counter()
-
-        if self.timer_chk.isChecked():
-            try:
-                hold_time_local = float(self.hold_entry.text())
-                release_time_local = float(self.release_entry.text())
-            except ValueError:
-                self.status_label.setText("Geçerli süreler girin.")
-                return
-
-            while self.running:
-                if self.reverse_chk.isChecked():
-                    self.release_key(self.affected_key)
-                    for _ in range(int(release_time_local * 100)):
-                        if not self.running:
-                            return
-                        time.sleep(0.01)
-                    self.press_key(self.affected_key)
-                    for _ in range(int(hold_time_local * 100)):
-                        if not self.running:
-                            self.release_key(self.affected_key)
-                            return
-                        time.sleep(0.01)
-                else:
-                    self.press_key(self.affected_key)
-                    for _ in range(int(hold_time_local * 100)):
-                        if not self.running:
-                            self.release_key(self.affected_key)
-                            return
-                        time.sleep(0.01)
-                    self.release_key(self.affected_key)
-                    for _ in range(int(release_time_local * 100)):
-                        if not self.running:
-                            return
-                        time.sleep(0.01)
-
-        elif self.effect_mode == "Basılı Tutma":
-            self.press_key(self.affected_key)
-            while self.running:
-                time.sleep(0.01)
-            self.release_key(self.affected_key)
-
-        else:  # Oto-click
-            while self.running:
-                now = time.perf_counter()
-                if now >= next_click_time:
-                    self.press_key(self.affected_key)
-                    self.release_key(self.affected_key)
-                    next_click_time += interval
-                else:
-                    sleep_time = max(0.0005, next_click_time - now)
-                    time.sleep(sleep_time)
-
-    def start_clicking(self):
-        # Stop any existing threads
-        self.running = False
-        time.sleep(0.01)
-
-
-        try:
-            count = int(self.clicker_entry.text())
-            self.clicker_count = max(1, count)
-        except:
-            self.clicker_count = 1
-
-        self.running = True
-        self.click_threads = []
-
-        # Birden fazla thread başlat
-        for i in range(self.clicker_count):
-            t = threading.Thread(target=self.perform_action, daemon=True)
-            t.start()
-            self.click_threads.append(t)
-
-        self.status_label.setText(f"Started with {self.clicker_count} clickers")
-
-    def stop_clicking(self):
-        self.running = False
-        self.status_label.setText("Tıklama Durduruldu")
-
-    def press_key(self, key_name):
-        try:
-            if key_name and key_name.startswith("mouse."):
-                btn = key_name.split(".")[1]
-                if btn == "left":
-                    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-                elif btn == "right":
-                    win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
-                elif btn == "middle":
-                    win32api.mouse_event(win32con.MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, 0)
-            elif key_name and len(key_name) == 1:
-                self.keyboard_controller.press(key_name)
-            elif key_name:
-                self.keyboard_controller.press(getattr(Key, key_name))
-        except Exception as e:
-            print(f"Hata (press): {e}")
-
-    def release_key(self, key_name):
-        try:
-            if key_name and key_name.startswith("mouse."):
-                btn = key_name.split(".")[1]
-                if btn == "left":
-                    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-                elif btn == "right":
-                    win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
-                elif btn == "middle":
-                    win32api.mouse_event(win32con.MOUSEEVENTF_MIDDLEUP, 0, 0, 0, 0)
-            elif key_name and len(key_name) == 1:
-                self.keyboard_controller.release(key_name)
-            elif key_name:
-                self.keyboard_controller.release(getattr(Key, key_name))
-        except Exception as e:
-            print(f"Hata (release): {e}")
-
-    def refresh_window_list(self):
+    def refresh_windows(self):
         self.window_combo.clear()
-        self.window_dict.clear()
-        exe_names = set()
-        for w in gw.getWindowsWithTitle(""):
-            try:
-                hwnd = w._hWnd
-                _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                proc = psutil.Process(pid)
-                exe_name = proc.name()
-                if exe_name and exe_name not in exe_names:
-                    exe_names.add(exe_name)
-                    self.window_dict[exe_name] = pid
-                    self.window_combo.addItem(exe_name)
-            except:
+        win32gui.EnumWindows(self.enum_handler, None)
+
+    def update_selected_pid(self):
+        if self.work_one_window:
+            index = self.window_combo.currentIndex()
+            if index != -1:
+                self.selected_pid = self.window_combo.itemData(index)
+
+    def toggle_window_mode(self):
+        self.work_one_window = self.work_checkbox.isChecked()
+
+        if self.work_one_window:
+            index = self.window_combo.currentIndex()
+            if index != -1:
+                self.selected_pid = self.window_combo.itemData(index)
+        else:
+            self.selected_pid = None
+            win32gui.EnumWindows(self.enum_handler, None)
+
+    def update_cps_from_entry(self, text):
+        if text:
+            self.cps = int(text)
+    # ---------------- HOOKS ----------------
+    def hook_thread(self):
+        self.kb_proc = ctypes.WINFUNCTYPE(
+            LRESULT, ctypes.c_int, wintypes.WPARAM, ctypes.c_void_p
+        )(self.keyboard_proc)
+
+        self.ms_proc = ctypes.WINFUNCTYPE(
+            LRESULT, ctypes.c_int, wintypes.WPARAM, ctypes.c_void_p
+        )(self.mouse_proc)
+
+        user32.SetWindowsHookExW(WH_KEYBOARD_LL, self.kb_proc, None, 0)
+        user32.SetWindowsHookExW(WH_MOUSE_LL, self.ms_proc, None, 0)
+
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+    # ---------------- CALLBACKS ----------------
+    def keyboard_proc(self, nCode, wParam, lParam):
+        if nCode == 0:
+            info = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+
+            if info.flags & LLKHF_INJECTED:
+                return user32.CallNextHookEx(0, nCode, wParam, lParam)
+
+            key = f"key.{info.vkCode}"
+            real_state[key] = (wParam == WM_KEYDOWN)
+
+            if listen_mode:
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "assign_key",
+                    Qt.QueuedConnection,
+                    QtCore.Q_ARG(str, key)
+                )
+                return 0
+
+        return user32.CallNextHookEx(0, nCode, wParam, lParam)
+
+    def mouse_proc(self, nCode, wParam, lParam):
+        if nCode == 0:
+            info = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+
+            if info.flags & LLMHF_INJECTED:
+                return user32.CallNextHookEx(0, nCode, wParam, lParam)
+
+            # ---------------- NORMAL BUTTONS ----------------
+            down = {
+                WM_LBUTTONDOWN: "mouse.left",
+                WM_RBUTTONDOWN: "mouse.right",
+                WM_MBUTTONDOWN: "mouse.middle",
+            }
+            up = {
+                WM_LBUTTONUP: "mouse.left",
+                WM_RBUTTONUP: "mouse.right",
+                WM_MBUTTONUP: "mouse.middle",
+            }
+
+            if wParam in down:
+                key = down[wParam]
+
+                if listen_mode:
+                    QtCore.QMetaObject.invokeMethod(
+                        self,
+                        "assign_key",
+                        Qt.QueuedConnection,
+                        QtCore.Q_ARG(str, key)
+                    )
+                    return 0
+
+                real_state[key] = True
+
+            elif wParam in up:
+                real_state[up[wParam]] = False
+
+            # ---------------- XBUTTONS ----------------
+            elif wParam == WM_XBUTTONDOWN:
+                xbtn = (info.mouseData >> 16) & 0xFFFF
+
+                if xbtn == XBUTTON1:
+                    key = "mouse.back"
+                elif xbtn == XBUTTON2:
+                    key = "mouse.forward"
+                else:
+                    return user32.CallNextHookEx(0, nCode, wParam, lParam)
+
+                if listen_mode:
+                    QtCore.QMetaObject.invokeMethod(
+                        self,
+                        "assign_key",
+                        Qt.QueuedConnection,
+                        QtCore.Q_ARG(str, key)
+                    )
+                    return 0
+
+                real_state[key] = True
+
+            elif wParam == WM_XBUTTONUP:
+                xbtn = (info.mouseData >> 16) & 0xFFFF
+
+                if xbtn == XBUTTON1:
+                    real_state["mouse.back"] = False
+                elif xbtn == XBUTTON2:
+                    real_state["mouse.forward"] = False
+
+        return user32.CallNextHookEx(0, nCode, wParam, lParam)
+
+    # ---------------- SLOT ----------------
+    @pyqtSlot(str)
+    def assign_key(self, key):
+        global listen_mode
+
+        if listen_mode == "trigger":
+            self.trigger_key = key
+            self.trigger_entry.setText(key)
+        else:
+            self.affected_key = key
+            self.affected_entry.setText(key)
+
+        listen_mode = None
+        self.status.setText("Assigned")
+
+    # ---------------- WORKER ----------------
+    def worker(self):
+        self.toggle_state = False
+        self._last_pressed = False
+        held_keys = set()
+        timer_phase = None
+        phase_end_time = 0
+
+        while True:
+            time.sleep(0.001)
+
+            if not self.trigger_key:
                 continue
 
-    def select_window(self, exe_name):
-        self.selected_pid = self.window_dict.get(exe_name, None)
+            if self.disable_checkbox.isChecked():
+                self.release_key_set(held_keys)
+                continue
 
-    def restart_program(self):
-        python = sys.executable
-        subprocess.Popen([python] + sys.argv)
-        os._exit(0)
+            pressed = real_state.get(self.trigger_key, False)
+            t_mode = self.trigger_mode_box.currentText()
+            a_mode = self.affected_mode_box.currentText()
+
+            # ---------------- HOLD MODE ----------------
+            if t_mode == "Hold":
+                active = pressed
+
+            # ---------------- TOGGLE MODE ----------------
+            else:
+                if pressed and not self._last_pressed:
+                    self.toggle_state = not self.toggle_state
+                    self._last_pressed = True
+                elif not pressed:
+                    self._last_pressed = False
+
+                active = self.toggle_state
+
+            # ---------------- INACTIVE ----------------
+            if not active:
+                self.release_key_set(held_keys)
+                timer_phase = None
+                phase_end_time = 0
+                continue
+            # ---------------- WINDOW FILTER ----------------
+            if self.work_one_window and self.selected_pid:
+                fg = user32.GetForegroundWindow()
+                if fg:
+                    _, fg_pid = win32process.GetWindowThreadProcessId(fg)
+                    if fg_pid != self.selected_pid:
+                        self.release_key_set(held_keys)
+                        continue
+            # ---------------- TIMER OFF ----------------
+            if not self.use_timer:
+                self.send_action(mode=a_mode, held_keys=held_keys)
+                time.sleep(1 / self.cps)
+                continue
+
+            # ---------------- TIMER ON ----------------
+            try:
+                hold_t = float(self.hold_entry.text())
+                release_t = float(self.release_entry.text())
+            except ValueError:
+                continue
+
+            reverse = self.reverse_checkbox.isChecked()
+            now = time.time()
+
+            if timer_phase is None:
+                if reverse:
+                    timer_phase = "release"
+                    phase_end_time = now + release_t
+                else:
+                    timer_phase = "hold"
+                    phase_end_time = now + hold_t
+
+                if timer_phase == "hold":
+                    self.send_action(mode="Hold", held_keys=held_keys)
+                continue
+
+            if now >= phase_end_time:
+                if timer_phase == "hold":
+                    self.release_key_set(held_keys)
+                    timer_phase = "release"
+                    phase_end_time = now + release_t
+                else:
+                    timer_phase = "hold"
+                    phase_end_time = now + hold_t
+                    self.send_action(mode="Hold", held_keys=held_keys)
+
+            if timer_phase == "hold":
+                self.send_action(mode="Hold", held_keys=held_keys)
+
+    # ---------------- ACTION ----------------
+    def send_action(self, mode="Auto-Click", held_keys=None):
+        if not self.affected_key:
+            return
+
+        if held_keys is None:
+            held_keys = set()
+
+        # ---------------- MOUSE ----------------
+        if self.affected_key.startswith("mouse"):
+
+            # XBUTTONS
+            if self.affected_key in ("mouse.back", "mouse.forward"):
+
+                xbtn = 1 if self.affected_key == "mouse.back" else 2
+
+                if mode == "Auto-Click":
+                    user32.mouse_event(MOUSEEVENTF_XDOWN, 0, 0, xbtn, 0)
+                    user32.mouse_event(MOUSEEVENTF_XUP,   0, 0, xbtn, 0)
+
+                elif mode == "Hold":
+                    if self.affected_key not in held_keys:
+                        user32.mouse_event(MOUSEEVENTF_XDOWN, 0, 0, xbtn, 0)
+                        held_keys.add(self.affected_key)
+
+            # NORMAL BUTTONS
+            else:
+                flags = {
+                    "mouse.left":   (MOUSEEVENTF_LEFTDOWN,   MOUSEEVENTF_LEFTUP),
+                    "mouse.right":  (MOUSEEVENTF_RIGHTDOWN,  MOUSEEVENTF_RIGHTUP),
+                    "mouse.middle": (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+                }
+
+                down, up = flags[self.affected_key]
+
+                if mode == "Auto-Click":
+                    user32.mouse_event(down, 0, 0, 0, 0)
+                    user32.mouse_event(up,   0, 0, 0, 0)
+
+                elif mode == "Hold":
+                    if self.affected_key not in held_keys:
+                        user32.mouse_event(down, 0, 0, 0, 0)
+                        held_keys.add(self.affected_key)
+
+        # ---------------- KEYBOARD ----------------
+        else:
+            vk = int(self.affected_key.split(".")[1])
+
+            if mode == "Auto-Click":
+                user32.keybd_event(vk, 0, 0, 0)
+                user32.keybd_event(vk, 0, 2, 0)
+
+            elif mode == "Hold":
+                if self.affected_key not in held_keys:
+                    user32.keybd_event(vk, 0, 0, 0)
+                    held_keys.add(self.affected_key)
+
+    def release_key_set(self, held_keys):
+        for k in list(held_keys):
+            self.release_key(k)
+            held_keys.remove(k)
+
+    def release_key(self, key):
+
+        if key == "mouse.back":
+            user32.mouse_event(MOUSEEVENTF_XUP, 0, 0, 1, 0)
+
+        elif key == "mouse.forward":
+            user32.mouse_event(MOUSEEVENTF_XUP, 0, 0, 2, 0)
+
+        elif key.startswith("mouse"):
+            flags = {
+                "mouse.left":   MOUSEEVENTF_LEFTUP,
+                "mouse.right":  MOUSEEVENTF_RIGHTUP,
+                "mouse.middle": MOUSEEVENTF_MIDDLEUP,
+            }
+            user32.mouse_event(flags[key], 0, 0, 0, 0)
+
+        else:
+            vk = int(key.split(".")[1])
+            user32.keybd_event(vk, 0, 2, 0)
+
+    # ---------------- HELPERS ----------------
+
+    def sleep_interruptible(self, seconds):
+        end = time.time() + seconds
+        while time.time() < end:
+            if self.trigger_mode_box.currentText() == "Toggle":
+                if not self.toggle_state:
+                    return
+            if self.disable_checkbox.isChecked():
+                return
+            time.sleep(0.01)
+
+    def toggle_timer_fields(self):
+        
+        active = self.timer_checkbox.isChecked()
+        self.use_timer = active
+
+        for w in (
+            self.hold_label,
+            self.hold_entry,
+            self.release_label,
+            self.release_entry,
+            self.reverse_checkbox,
+        ):
+            w.setVisible(active)
+
+    def set_listen(self, mode):
+        global listen_mode
+        listen_mode = mode
+        self.status.setText(f"Press {mode} key...")
 
     def eventFilter(self, obj, event):
-        # Tab, Shift+Tab, Space, Enter, Escape, Arrow keys, PageUp, PageDown, Home, End
         if event.type() == QEvent.KeyPress:
             forbidden_keys = {
-                Qt.Key_Tab, Qt.Key_Backtab, Qt.Key_Space, Qt.Key_Return,
-                Qt.Key_Enter, Qt.Key_Escape, Qt.Key_Up, Qt.Key_Down,
-                Qt.Key_Left, Qt.Key_Right, Qt.Key_PageUp, Qt.Key_PageDown,
-                Qt.Key_Home, Qt.Key_End
+                Qt.Key_Tab,
+                Qt.Key_Backtab,
+                Qt.Key_Space,
+                Qt.Key_Return,
+                Qt.Key_Enter,
+                Qt.Key_Escape,
+                Qt.Key_Up,
+                Qt.Key_Down,
+                Qt.Key_Left,
+                Qt.Key_Right,
+                Qt.Key_PageUp,
+                Qt.Key_PageDown,
+                Qt.Key_Home,
+                Qt.Key_End
             }
             if event.key() in forbidden_keys:
-                return True  # Ignore the event
-        return super().eventFilter(obj, event)
-
+                return True
+        return QWidget.eventFilter(self, obj, event)
+    
     def closeEvent(self, event):
-        try:
-            self.keyboard_listener.stop()
-        except:
-            pass
-        try:
-            self.mouse_listener.stop()
-        except:
-            pass
-        os._exit(0)
-
-def main():
-    app = QApplication(sys.argv)
-    window = AutoClicker()
-    app.installEventFilter(window)
-    window.show()
-    sys.exit(app.exec_())
+        _exit(0)
+# ============================================
+# ENTRY
+# ============================================
 
 if __name__ == "__main__":
-    main()
+    app = QApplication(sys.argv)
+    w = AutoClicker()
+    w.show()
+    sys.exit(app.exec_())
