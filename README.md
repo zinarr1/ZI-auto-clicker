@@ -15,6 +15,7 @@ ZI Auto Clicker is an advanced Windows auto-clicker and key/mouse automation too
 - Limit functionality to a specific application window
 - Timer with configurable hold/release durations
 - Easy-to-use GUI
+- Disable key
 
 ---
 ## Safety & Security
