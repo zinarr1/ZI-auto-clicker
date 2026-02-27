@@ -102,7 +102,7 @@ class AutoClicker(QWidget):
         super().__init__()
 
         self.setWindowTitle("Low-Level Hook ZIAutoClicker")
-        self.setFixedSize(420, 350)
+        self.setMinimumSize(420, 380)
 
         self.trigger_key = None
         self.affected_key = None
@@ -117,13 +117,16 @@ class AutoClicker(QWidget):
         self.hold_duration = 1.0
         self.release_duration = 1.0
         self.toggle_timer_running = False
-        
+        self.disable_key = None
+
+        self.stop_event = threading.Event()
+        self.wake_event = threading.Event()
+
         # UI
         self.build_ui()
      
         # Worker thread  
-        self.worker_thread = threading.Thread(target=self.worker, daemon=True)    
-        self.worker_thread.start()
+        threading.Thread(target=self.worker, daemon=True).start()
 
         threading.Thread(target=self.hook_thread, daemon=True).start()
 
@@ -154,7 +157,11 @@ class AutoClicker(QWidget):
         self.cps_entry.setPlaceholderText("CPS number")
         self.cps_entry.setFixedWidth(60)
         self.cps_entry.setText(str(self.cps))
-        self.cps_entry.setValidator(QIntValidator())
+
+        validator = QDoubleValidator()
+        validator.setNotation(QDoubleValidator.StandardNotation)
+        self.cps_entry.setValidator(validator)
+
         layout.addWidget(self.cps_entry, 2, 1, 1, 2)
 
         self.cps_entry.textChanged.connect(self.update_cps_from_entry)
@@ -179,6 +186,16 @@ class AutoClicker(QWidget):
         layout.addWidget(self.timer_checkbox, 6, 0, 1, 3)
         self.timer_checkbox.stateChanged.connect(self.toggle_timer_fields)
 
+        layout.addWidget(QLabel("Disable Key"), 13, 0)
+
+        self.disable_entry = QLineEdit()
+        self.disable_entry.setReadOnly(True)
+        layout.addWidget(self.disable_entry, 13, 1)
+
+        btn = QPushButton("Select")
+        btn.clicked.connect(lambda: self.set_listen("disable"))
+        layout.addWidget(btn, 13, 2)
+
         self.hold_label = QLabel("Hold duration (sec)")
         layout.addWidget(self.hold_label, 7, 0)
         self.hold_entry = QLineEdit("1.0")
@@ -199,7 +216,10 @@ class AutoClicker(QWidget):
 
         self.window_combo = QComboBox()
         layout.addWidget(self.window_combo, 11, 0, 1, 3)
+        self.refresh_btn = QPushButton("Refresh Windows")
+        layout.addWidget(self.refresh_btn, 12, 0, 1, 3)
 
+        self.refresh_btn.clicked.connect(self.refresh_windows)
         self.refresh_windows()
         self.window_combo.currentIndexChanged.connect(self.update_selected_pid)
         self.work_checkbox.stateChanged.connect(self.toggle_window_mode)
@@ -235,9 +255,20 @@ class AutoClicker(QWidget):
                     pass
 
     def refresh_windows(self):
+        previous_pid = self.selected_pid
+
+        self.window_combo.blockSignals(True)
         self.window_combo.clear()
+
         win32gui.EnumWindows(self.enum_handler, None)
 
+        self.window_combo.blockSignals(False)
+
+        if previous_pid:
+            for i in range(self.window_combo.count()):
+                if self.window_combo.itemData(i) == previous_pid:
+                    self.window_combo.setCurrentIndex(i)
+                    break
     def update_selected_pid(self):
         if self.work_one_window:
             index = self.window_combo.currentIndex()
@@ -253,11 +284,12 @@ class AutoClicker(QWidget):
                 self.selected_pid = self.window_combo.itemData(index)
         else:
             self.selected_pid = None
-            win32gui.EnumWindows(self.enum_handler, None)
 
     def update_cps_from_entry(self, text):
-        if text:
-            self.cps = int(text)
+        try:
+            self.cps = float(text)
+        except ValueError:
+            self.cps = 0.0
     # ---------------- HOOKS ----------------
     def hook_thread(self):
         self.kb_proc = ctypes.WINFUNCTYPE(
@@ -285,7 +317,14 @@ class AutoClicker(QWidget):
                 return user32.CallNextHookEx(0, nCode, wParam, lParam)
 
             key = f"key.{info.vkCode}"
+
+            # ---- DISABLE HOTKEY ----
+            if listen_mode is None and self.disable_key == key and wParam == WM_KEYDOWN:
+                self.toggle_disable()
+                return 1
+
             real_state[key] = (wParam == WM_KEYDOWN)
+            self.wake_event.set()
 
             if listen_mode:
                 QtCore.QMetaObject.invokeMethod(
@@ -305,37 +344,30 @@ class AutoClicker(QWidget):
             if info.flags & LLMHF_INJECTED:
                 return user32.CallNextHookEx(0, nCode, wParam, lParam)
 
-            # ---------------- NORMAL BUTTONS ----------------
+            key = None
+
             down = {
                 WM_LBUTTONDOWN: "mouse.left",
                 WM_RBUTTONDOWN: "mouse.right",
                 WM_MBUTTONDOWN: "mouse.middle",
             }
+
             up = {
                 WM_LBUTTONUP: "mouse.left",
                 WM_RBUTTONUP: "mouse.right",
                 WM_MBUTTONUP: "mouse.middle",
             }
 
+            # ---------------- NORMAL BUTTONS ----------------
             if wParam in down:
                 key = down[wParam]
 
-                if listen_mode:
-                    QtCore.QMetaObject.invokeMethod(
-                        self,
-                        "assign_key",
-                        Qt.QueuedConnection,
-                        QtCore.Q_ARG(str, key)
-                    )
-                    return 0
-
-                real_state[key] = True
-
             elif wParam in up:
-                real_state[up[wParam]] = False
+                key = up[wParam]
 
             # ---------------- XBUTTONS ----------------
-            elif wParam == WM_XBUTTONDOWN:
+            elif wParam in (WM_XBUTTONDOWN, WM_XBUTTONUP):
+
                 xbtn = (info.mouseData >> 16) & 0xFFFF
 
                 if xbtn == XBUTTON1:
@@ -345,27 +377,35 @@ class AutoClicker(QWidget):
                 else:
                     return user32.CallNextHookEx(0, nCode, wParam, lParam)
 
-                if listen_mode:
-                    QtCore.QMetaObject.invokeMethod(
-                        self,
-                        "assign_key",
-                        Qt.QueuedConnection,
-                        QtCore.Q_ARG(str, key)
-                    )
-                    return 0
+            if key is None:
+                return user32.CallNextHookEx(0, nCode, wParam, lParam)
 
+            # ---- DISABLE HOTKEY CHECK ----
+            if listen_mode is None and self.disable_key == key and wParam in (
+                WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN, WM_XBUTTONDOWN
+            ):
+                self.toggle_disable()
+                return 1
+
+            # ---- LISTEN MODE ----
+            if listen_mode:
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "assign_key",
+                    Qt.QueuedConnection,
+                    QtCore.Q_ARG(str, key)
+                )
+                return 0
+
+            # ---- STATE UPDATE ----
+            if wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN, WM_XBUTTONDOWN):
                 real_state[key] = True
+            else:
+                real_state[key] = False
 
-            elif wParam == WM_XBUTTONUP:
-                xbtn = (info.mouseData >> 16) & 0xFFFF
-
-                if xbtn == XBUTTON1:
-                    real_state["mouse.back"] = False
-                elif xbtn == XBUTTON2:
-                    real_state["mouse.forward"] = False
+            self.wake_event.set()
 
         return user32.CallNextHookEx(0, nCode, wParam, lParam)
-
     # ---------------- SLOT ----------------
     @pyqtSlot(str)
     def assign_key(self, key):
@@ -374,103 +414,150 @@ class AutoClicker(QWidget):
         if listen_mode == "trigger":
             self.trigger_key = key
             self.trigger_entry.setText(key)
-        else:
+
+        elif listen_mode == "affected":
             self.affected_key = key
             self.affected_entry.setText(key)
+
+        elif listen_mode == "disable":
+            self.disable_key = key
+            self.disable_entry.setText(key)
 
         listen_mode = None
         self.status.setText("Assigned")
 
     # ---------------- WORKER ----------------
     def worker(self):
+
         self.toggle_state = False
         self._last_pressed = False
         held_keys = set()
         timer_phase = None
         phase_end_time = 0
 
-        while True:
-            time.sleep(0.001)
+        next_click_time = 0
+        interval = 0
 
-            if not self.trigger_key:
-                continue
+        while not self.stop_event.is_set():
 
-            if self.disable_checkbox.isChecked():
-                self.release_key_set(held_keys)
-                continue
+            self.wake_event.wait()
+            self.wake_event.clear()
 
-            pressed = real_state.get(self.trigger_key, False)
-            t_mode = self.trigger_mode_box.currentText()
-            a_mode = self.affected_mode_box.currentText()
+            if self.stop_event.is_set():
+                break
 
-            # ---------------- HOLD MODE ----------------
-            if t_mode == "Hold":
-                active = pressed
-
-            # ---------------- TOGGLE MODE ----------------
-            else:
-                if pressed and not self._last_pressed:
-                    self.toggle_state = not self.toggle_state
-                    self._last_pressed = True
-                elif not pressed:
-                    self._last_pressed = False
-
-                active = self.toggle_state
-
-            # ---------------- INACTIVE ----------------
-            if not active:
-                self.release_key_set(held_keys)
-                timer_phase = None
-                phase_end_time = 0
-                continue
-            # ---------------- WINDOW FILTER ----------------
-            if self.work_one_window and self.selected_pid:
-                fg = user32.GetForegroundWindow()
-                if fg:
-                    _, fg_pid = win32process.GetWindowThreadProcessId(fg)
-                    if fg_pid != self.selected_pid:
-                        self.release_key_set(held_keys)
-                        continue
-            # ---------------- TIMER OFF ----------------
-            if not self.use_timer:
-                self.send_action(mode=a_mode, held_keys=held_keys)
-                time.sleep(1 / self.cps)
-                continue
-
-            # ---------------- TIMER ON ----------------
-            try:
-                hold_t = float(self.hold_entry.text())
-                release_t = float(self.release_entry.text())
-            except ValueError:
-                continue
-
-            reverse = self.reverse_checkbox.isChecked()
-            now = time.time()
-
-            if timer_phase is None:
-                if reverse:
-                    timer_phase = "release"
-                    phase_end_time = now + release_t
-                else:
-                    timer_phase = "hold"
-                    phase_end_time = now + hold_t
-
-                if timer_phase == "hold":
-                    self.send_action(mode="Hold", held_keys=held_keys)
-                continue
-
-            if now >= phase_end_time:
-                if timer_phase == "hold":
+            while not self.stop_event.is_set():
+                # ---- DISABLE CHECK ----
+                if self.disable_checkbox.isChecked():
                     self.release_key_set(held_keys)
-                    timer_phase = "release"
-                    phase_end_time = now + release_t
+                    time.sleep(0.01)
+                    continue
+
+                if not self.trigger_key:
+                    break
+
+                if self.disable_checkbox.isChecked():
+                    self.release_key_set(held_keys)
+                    break
+
+                pressed = real_state.get(self.trigger_key, False)
+                t_mode = self.trigger_mode_box.currentText()
+                a_mode = self.affected_mode_box.currentText()
+
+                # ---------------- HOLD MODE ----------------
+                if t_mode == "Hold":
+                    active = pressed
+
+                # ---------------- TOGGLE MODE ----------------
                 else:
-                    timer_phase = "hold"
-                    phase_end_time = now + hold_t
+                    if pressed and not self._last_pressed:
+                        self.toggle_state = not self.toggle_state
+                        self._last_pressed = True
+                    elif not pressed:
+                        self._last_pressed = False
+
+                    active = self.toggle_state
+
+                # ---------------- INACTIVE ----------------
+                if not active:
+                    self.release_key_set(held_keys)
+                    timer_phase = None
+                    phase_end_time = 0
+                    next_click_time = 0
+                    break
+
+                # ---------------- WINDOW FILTER ----------------
+                if self.work_one_window and self.selected_pid:
+                    fg = user32.GetForegroundWindow()
+                    if fg:
+                        _, fg_pid = win32process.GetWindowThreadProcessId(fg)
+                        if fg_pid != self.selected_pid:
+                            self.release_key_set(held_keys)
+                            time.sleep(0.01)
+                            continue
+
+                # ================= TIMER OFF (CPS MODE) =================
+                if not self.use_timer:
+
+                    if self.cps > 0:
+
+                        if next_click_time == 0:
+                            interval = 1.0 / self.cps
+                            next_click_time = time.perf_counter()
+
+                        now = time.perf_counter()
+
+                        if now >= next_click_time:
+                            self.send_action(mode=a_mode, held_keys=held_keys)
+                            next_click_time += interval
+                        else:
+                            sleep_time = next_click_time - now
+                            if sleep_time > 0:
+                                time.sleep(min(0.002, sleep_time))
+                    else:
+                        time.sleep(0.01)
+
+                    continue
+
+                # ================= TIMER ON =================
+                try:
+                    hold_t = float(self.hold_entry.text())
+                    release_t = float(self.release_entry.text())
+                except ValueError:
+                    break
+
+                reverse = self.reverse_checkbox.isChecked()
+                now = time.time()
+
+                if timer_phase is None:
+
+                    if reverse:
+                        timer_phase = "release"
+                        phase_end_time = now + release_t
+                    else:
+                        timer_phase = "hold"
+                        phase_end_time = now + hold_t
+
+                    if timer_phase == "hold":
+                        self.send_action(mode="Hold", held_keys=held_keys)
+
+                    continue
+
+                if now >= phase_end_time:
+
+                    if timer_phase == "hold":
+                        self.release_key_set(held_keys)
+                        timer_phase = "release"
+                        phase_end_time = now + release_t
+                    else:
+                        timer_phase = "hold"
+                        phase_end_time = now + hold_t
+                        self.send_action(mode="Hold", held_keys=held_keys)
+
+                if timer_phase == "hold":
                     self.send_action(mode="Hold", held_keys=held_keys)
 
-            if timer_phase == "hold":
-                self.send_action(mode="Hold", held_keys=held_keys)
+                time.sleep(0.001)
 
     # ---------------- ACTION ----------------
     def send_action(self, mode="Auto-Click", held_keys=None):
@@ -556,6 +643,25 @@ class AutoClicker(QWidget):
 
     # ---------------- HELPERS ----------------
 
+    def toggle_disable(self):
+        current = self.disable_checkbox.isChecked()
+        new_state = not current
+
+        QtCore.QMetaObject.invokeMethod(
+            self.disable_checkbox,
+            "setChecked",
+            Qt.QueuedConnection,
+            QtCore.Q_ARG(bool, new_state)
+        )
+
+        if not new_state:
+            for k in list(real_state.keys()):
+                real_state[k] = False
+
+            self.toggle_state = False
+            self._last_pressed = False
+            self.wake_event.set()
+
     def sleep_interruptible(self, seconds):
         end = time.time() + seconds
         while time.time() < end:
@@ -608,6 +714,8 @@ class AutoClicker(QWidget):
         return QWidget.eventFilter(self, obj, event)
     
     def closeEvent(self, event):
+        self.stop_event.set()
+        self.wake_event.set()
         _exit(0)
 # ============================================
 # ENTRY
