@@ -6,7 +6,7 @@ ZI Auto Clicker is an advanced Windows auto-clicker and key/mouse automation too
 
 ## Features
 
-- Low-level hooks (can use same buttons)
+- Low-level hooks (can use same buttons like left-click to left-click)
 - Select Trigger Key
 - Select Affected Key
 - Auto-click or Hold Down modes
