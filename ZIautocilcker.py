@@ -12,12 +12,17 @@ from PyQt5.QtWidgets import (
     QPushButton, QComboBox, QGridLayout
 )
 from PyQt5.QtGui import QDoubleValidator
-from PyQt5.QtGui import QIntValidator
-from PyQt5.QtCore import pyqtSlot, Qt, Q_ARG, QMetaObject
+from PyQt5.QtCore import pyqtSlot, Qt
 from os import _exit
 import win32gui
 import win32process
 import psutil
+import win32con
+
+from pynput.mouse import Controller as MouseController
+from pynput.keyboard import Controller as KeyboardController
+from pynput.mouse import Button
+from pynput.keyboard import KeyCode
 # ============================================
 # WINDOWS / CTYPES SETUP
 # ============================================
@@ -42,15 +47,6 @@ WM_XBUTTONUP   = 0x020C
 XBUTTON1 = 1
 XBUTTON2 = 2
 
-MOUSEEVENTF_LEFTDOWN   = 0x0002
-MOUSEEVENTF_LEFTUP     = 0x0004
-MOUSEEVENTF_RIGHTDOWN  = 0x0008
-MOUSEEVENTF_RIGHTUP    = 0x0010
-MOUSEEVENTF_MIDDLEDOWN = 0x0020
-MOUSEEVENTF_MIDDLEUP   = 0x0040
-MOUSEEVENTF_XDOWN      = 0x0080
-MOUSEEVENTF_XUP        = 0x0100
-
 LLKHF_INJECTED = 0x10
 LLMHF_INJECTED = 0x01
 
@@ -64,23 +60,37 @@ user32.CallNextHookEx.argtypes = (
 )
 user32.CallNextHookEx.restype = LRESULT
 
+user32.SetWindowsHookExW.argtypes = (
+    ctypes.c_int,
+    ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, ctypes.c_void_p),
+    wintypes.HINSTANCE,
+    wintypes.DWORD
+)
+
+user32.SetWindowsHookExW.restype = wintypes.HHOOK
 # ============================================
 # STRUCTS
 # ============================================
-
-class KBDLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [
-        ("vkCode", wintypes.DWORD),
-        ("scanCode", wintypes.DWORD),
-        ("flags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.c_void_p),
-    ]
+HOOKPROC = ctypes.WINFUNCTYPE(
+    LRESULT,
+    ctypes.c_int,
+    wintypes.WPARAM,
+    ctypes.c_void_p
+)
 
 class MSLLHOOKSTRUCT(ctypes.Structure):
     _fields_ = [
         ("pt", wintypes.POINT),
         ("mouseData", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_void_p),
+    ]
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", wintypes.DWORD),
+        ("scanCode", wintypes.DWORD),
         ("flags", wintypes.DWORD),
         ("time", wintypes.DWORD),
         ("dwExtraInfo", ctypes.c_void_p),
@@ -102,32 +112,33 @@ class AutoClicker(QWidget):
         super().__init__()
 
         self.setWindowTitle("Low-Level Hook ZIAutoClicker")
-        self.setMinimumSize(420, 380)
+        self.setMinimumSize(420, 480)
+        self.setMaximumSize(420, 480)
+
 
         self.trigger_key = None
         self.affected_key = None
-        self.running = False
         self.cps = 15
 
         self.work_one_window = False
         self.selected_pid = None
 
-        self.timer_running = False
         self.use_timer = False
         self.hold_duration = 1.0
         self.release_duration = 1.0
-        self.toggle_timer_running = False
         self.disable_key = None
 
         self.stop_event = threading.Event()
         self.wake_event = threading.Event()
+
+        self.mouse = MouseController()
+        self.keyboard = KeyboardController()
 
         # UI
         self.build_ui()
      
         # Worker thread  
         threading.Thread(target=self.worker, daemon=True).start()
-
         threading.Thread(target=self.hook_thread, daemon=True).start()
 
     # ---------------- UI ----------------
@@ -181,6 +192,7 @@ class AutoClicker(QWidget):
         self.disable_checkbox = QtWidgets.QCheckBox("Disable.")
         self.disable_checkbox.setChecked(False)
         layout.addWidget(self.disable_checkbox, 5, 0, 1, 3)
+        self.disable_checkbox.stateChanged.connect(self.update_disable_overlay)
 
         self.timer_checkbox = QtWidgets.QCheckBox("Enable Timer")
         layout.addWidget(self.timer_checkbox, 6, 0, 1, 3)
@@ -226,6 +238,48 @@ class AutoClicker(QWidget):
 
         self.reverse_checkbox = QtWidgets.QCheckBox("Reverse time duration order")
         layout.addWidget(self.reverse_checkbox, 9, 0, 1, 3)
+
+        # ===== OVERLAY LABEL =====
+
+        self.disable_overlaysh = QtWidgets.QCheckBox("Show display")
+        self.disable_overlaysh.setChecked(True)
+        layout.addWidget(self.disable_overlaysh, 16, 0, 1, 3)
+
+        self.disable_overlaysh.stateChanged.connect(self.hidedisplay)
+
+        self.disable_overlay = QLabel("OFF")
+        self.disable_overlay.setStyleSheet("""
+        QLabel {
+            color: lime;
+            background: transparent;
+            font-size: 18px;
+            font-weight: bold;
+        }
+        """)
+
+        self.disable_overlay.setWindowFlags(
+            Qt.Tool |
+            Qt.FramelessWindowHint |
+            Qt.WindowStaysOnTopHint
+        )
+
+        hwnd = int(self.disable_overlay.winId())
+
+        ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        win32gui.SetWindowLong(
+            hwnd,
+            win32con.GWL_EXSTYLE,
+            ex_style | win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT
+        )
+        self.disable_overlay.setAttribute(Qt.WA_TranslucentBackground)
+
+        screen = QApplication.primaryScreen().geometry()
+
+        x = screen.width() - 120
+        y = 20
+
+        self.disable_overlay.move(x, y)
+        self.disable_overlay.show()
 
         self.hold_label.hide()
         self.hold_entry.hide()
@@ -292,16 +346,24 @@ class AutoClicker(QWidget):
             self.cps = 0.0
     # ---------------- HOOKS ----------------
     def hook_thread(self):
-        self.kb_proc = ctypes.WINFUNCTYPE(
-            LRESULT, ctypes.c_int, wintypes.WPARAM, ctypes.c_void_p
-        )(self.keyboard_proc)
 
-        self.ms_proc = ctypes.WINFUNCTYPE(
-            LRESULT, ctypes.c_int, wintypes.WPARAM, ctypes.c_void_p
-        )(self.mouse_proc)
+        self.ms_proc = HOOKPROC(self.mouse_proc)
 
-        user32.SetWindowsHookExW(WH_KEYBOARD_LL, self.kb_proc, None, 0)
-        user32.SetWindowsHookExW(WH_MOUSE_LL, self.ms_proc, None, 0)
+        self.mouse_hook = user32.SetWindowsHookExW(
+            WH_MOUSE_LL,
+            self.ms_proc,
+            None,
+            0
+        )
+
+        self.kb_proc = HOOKPROC(self.keyboard_proc)
+
+        self.keyboard_hook = user32.SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            self.kb_proc,
+            None,
+            0
+        )
 
         msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
@@ -309,33 +371,39 @@ class AutoClicker(QWidget):
             user32.DispatchMessageW(ctypes.byref(msg))
 
     # ---------------- CALLBACKS ----------------
+
+
     def keyboard_proc(self, nCode, wParam, lParam):
+
         if nCode == 0:
+
             info = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
 
             if info.flags & LLKHF_INJECTED:
                 return user32.CallNextHookEx(0, nCode, wParam, lParam)
 
-            key = f"key.{info.vkCode}"
+            vk = info.vkCode
 
-            # ---- DISABLE HOTKEY ----
-            if listen_mode is None and self.disable_key == key and wParam == WM_KEYDOWN:
-                self.toggle_disable()
-                return 1
+            if wParam == WM_KEYDOWN:
 
-            real_state[key] = (wParam == WM_KEYDOWN)
-            self.wake_event.set()
+                # ---- LISTEN MODE ----
+                if listen_mode:
+                    QtCore.QMetaObject.invokeMethod(
+                        self,
+                        "assign_key",
+                        Qt.QueuedConnection,
+                        QtCore.Q_ARG(object, vk)
+                    )
+                    return 1
 
-            if listen_mode:
-                QtCore.QMetaObject.invokeMethod(
-                    self,
-                    "assign_key",
-                    Qt.QueuedConnection,
-                    QtCore.Q_ARG(str, key)
-                )
-                return 0
+                real_state[vk] = True
+                self.wake_event.set()
 
-        return user32.CallNextHookEx(0, nCode, wParam, lParam)
+            elif wParam == WM_KEYUP:
+                real_state[vk] = False
+                self.wake_event.set()
+
+        return user32.CallNextHookEx(self.keyboard_hook, nCode, wParam, lParam)
 
     def mouse_proc(self, nCode, wParam, lParam):
         if nCode == 0:
@@ -393,9 +461,8 @@ class AutoClicker(QWidget):
                     self,
                     "assign_key",
                     Qt.QueuedConnection,
-                    QtCore.Q_ARG(str, key)
+                    QtCore.Q_ARG(object, key)
                 )
-                return 0
 
             # ---- STATE UPDATE ----
             if wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN, WM_XBUTTONDOWN):
@@ -405,23 +472,23 @@ class AutoClicker(QWidget):
 
             self.wake_event.set()
 
-        return user32.CallNextHookEx(0, nCode, wParam, lParam)
+        return user32.CallNextHookEx(self.mouse_hook, nCode, wParam, lParam)
     # ---------------- SLOT ----------------
-    @pyqtSlot(str)
+    @pyqtSlot(object)
     def assign_key(self, key):
         global listen_mode
 
         if listen_mode == "trigger":
             self.trigger_key = key
-            self.trigger_entry.setText(key)
+            self.trigger_entry.setText(str(key))
 
         elif listen_mode == "affected":
             self.affected_key = key
-            self.affected_entry.setText(key)
+            self.affected_entry.setText(str(key))
 
         elif listen_mode == "disable":
             self.disable_key = key
-            self.disable_entry.setText(key)
+            self.disable_entry.setText(str(key))
 
         listen_mode = None
         self.status.setText("Assigned")
@@ -509,7 +576,7 @@ class AutoClicker(QWidget):
 
                         if now >= next_click_time:
                             self.send_action(mode=a_mode, held_keys=held_keys)
-                            next_click_time += interval
+                            next_click_time = now + interval
                         else:
                             sleep_time = next_click_time - now
                             if sleep_time > 0:
@@ -561,6 +628,7 @@ class AutoClicker(QWidget):
 
     # ---------------- ACTION ----------------
     def send_action(self, mode="Auto-Click", held_keys=None):
+
         if not self.affected_key:
             return
 
@@ -568,52 +636,44 @@ class AutoClicker(QWidget):
             held_keys = set()
 
         # ---------------- MOUSE ----------------
-        if self.affected_key.startswith("mouse"):
+        if isinstance(self.affected_key, str) and self.affected_key.startswith("mouse"):
 
-            # XBUTTONS
-            if self.affected_key in ("mouse.back", "mouse.forward"):
+            button_map = {
+                "mouse.left": Button.left,
+                "mouse.right": Button.right,
+                "mouse.middle": Button.middle,
+                "mouse.back": Button.x1,
+                "mouse.forward": Button.x2,
+            }
 
-                xbtn = 1 if self.affected_key == "mouse.back" else 2
-
-                if mode == "Auto-Click":
-                    user32.mouse_event(MOUSEEVENTF_XDOWN, 0, 0, xbtn, 0)
-                    user32.mouse_event(MOUSEEVENTF_XUP,   0, 0, xbtn, 0)
-
-                elif mode == "Hold":
-                    if self.affected_key not in held_keys:
-                        user32.mouse_event(MOUSEEVENTF_XDOWN, 0, 0, xbtn, 0)
-                        held_keys.add(self.affected_key)
-
-            # NORMAL BUTTONS
-            else:
-                flags = {
-                    "mouse.left":   (MOUSEEVENTF_LEFTDOWN,   MOUSEEVENTF_LEFTUP),
-                    "mouse.right":  (MOUSEEVENTF_RIGHTDOWN,  MOUSEEVENTF_RIGHTUP),
-                    "mouse.middle": (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
-                }
-
-                down, up = flags[self.affected_key]
-
-                if mode == "Auto-Click":
-                    user32.mouse_event(down, 0, 0, 0, 0)
-                    user32.mouse_event(up,   0, 0, 0, 0)
-
-                elif mode == "Hold":
-                    if self.affected_key not in held_keys:
-                        user32.mouse_event(down, 0, 0, 0, 0)
-                        held_keys.add(self.affected_key)
-
-        # ---------------- KEYBOARD ----------------
-        else:
-            vk = int(self.affected_key.split(".")[1])
+            btn = button_map.get(self.affected_key)
+            if not btn:
+                return
 
             if mode == "Auto-Click":
-                user32.keybd_event(vk, 0, 0, 0)
-                user32.keybd_event(vk, 0, 2, 0)
+                self.mouse.press(btn)
+                self.mouse.release(btn)
 
             elif mode == "Hold":
                 if self.affected_key not in held_keys:
-                    user32.keybd_event(vk, 0, 0, 0)
+                    self.mouse.press(btn)
+                    held_keys.add(self.affected_key)
+
+        # ---------------- KEYBOARD ----------------
+        else:
+
+            if isinstance(self.affected_key, int):
+                key = KeyCode.from_vk(self.affected_key)
+            else:
+                return
+
+            if mode == "Auto-Click":
+                self.keyboard.press(key)
+                self.keyboard.release(key)
+
+            elif mode == "Hold":
+                if self.affected_key not in held_keys:
+                    self.keyboard.press(key)
                     held_keys.add(self.affected_key)
 
     def release_key_set(self, held_keys):
@@ -623,23 +683,24 @@ class AutoClicker(QWidget):
 
     def release_key(self, key):
 
-        if key == "mouse.back":
-            user32.mouse_event(MOUSEEVENTF_XUP, 0, 0, 1, 0)
+        if isinstance(key, str) and key.startswith("mouse"):
 
-        elif key == "mouse.forward":
-            user32.mouse_event(MOUSEEVENTF_XUP, 0, 0, 2, 0)
-
-        elif key.startswith("mouse"):
-            flags = {
-                "mouse.left":   MOUSEEVENTF_LEFTUP,
-                "mouse.right":  MOUSEEVENTF_RIGHTUP,
-                "mouse.middle": MOUSEEVENTF_MIDDLEUP,
+            button_map = {
+                "mouse.left": Button.left,
+                "mouse.right": Button.right,
+                "mouse.middle": Button.middle,
+                "mouse.back": Button.x1,
+                "mouse.forward": Button.x2,
             }
-            user32.mouse_event(flags[key], 0, 0, 0, 0)
+
+            btn = button_map.get(key)
+            if btn:
+                self.mouse.release(btn)
 
         else:
-            vk = int(key.split(".")[1])
-            user32.keybd_event(vk, 0, 2, 0)
+
+            if isinstance(key, int):
+                self.keyboard.release(KeyCode.from_vk(key))
 
     # ---------------- HELPERS ----------------
 
@@ -661,16 +722,43 @@ class AutoClicker(QWidget):
             self.toggle_state = False
             self._last_pressed = False
             self.wake_event.set()
+        QtCore.QMetaObject.invokeMethod(
+            self,
+            "update_disable_overlay",
+            Qt.QueuedConnection
+        )
 
-    def sleep_interruptible(self, seconds):
-        end = time.time() + seconds
-        while time.time() < end:
-            if self.trigger_mode_box.currentText() == "Toggle":
-                if not self.toggle_state:
-                    return
-            if self.disable_checkbox.isChecked():
-                return
-            time.sleep(0.01)
+    @pyqtSlot()
+    def update_disable_overlay(self):
+
+        if self.disable_checkbox.isChecked():
+            self.disable_overlay.setText("OFF")
+            self.disable_overlay.setStyleSheet("""
+            QLabel {
+                color: red;
+                background: transparent;
+                font-size: 18px;
+                font-weight: bold;
+            }
+            """)
+        else:
+            self.disable_overlay.setText("READY")
+            self.disable_overlay.setStyleSheet("""
+            QLabel {
+                color: lime;
+                background: transparent;
+                font-size: 18px;
+                font-weight: bold;
+            }
+            """)
+        self.disable_overlay.adjustSize()
+
+
+    def hidedisplay(self):
+        if self.disable_overlaysh.isChecked():
+            self.disable_overlay.show()
+        else:
+            self.disable_overlay.hide() 
 
     def toggle_timer_fields(self):
         
